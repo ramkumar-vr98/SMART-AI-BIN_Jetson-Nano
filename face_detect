@@ -1,0 +1,109 @@
+import cv2
+import time
+import Jetson.GPIO as GPIO
+
+# ----------------------------
+# Camera pipeline (IMX219)
+# flip-method=2 = rotate 180 degrees
+# ----------------------------
+gst_pipeline = (
+    "nvarguscamerasrc ! "
+    "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
+    "nvvidconv flip-method=2 ! "
+    "video/x-raw, format=BGRx ! "
+    "videoconvert ! "
+    "video/x-raw, format=BGR ! "
+    "appsink"
+)
+
+# ----------------------------
+# Stepper motor GPIO pins
+# ----------------------------
+IN1, IN2, IN3, IN4 = 17, 18, 22, 23
+motor_pins = [IN1, IN2, IN3, IN4]
+
+step_sequence = [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+]
+
+def setup_motor():
+    GPIO.setmode(GPIO.BCM)
+    for p in motor_pins:
+        GPIO.setup(p, GPIO.OUT)
+        GPIO.output(p, 0)
+
+def rotate_motor(steps=100):
+    for _ in range(steps):
+        for step in step_sequence:
+            for pin, val in zip(motor_pins, step):
+                GPIO.output(pin, val)
+            time.sleep(0.01)
+
+def cleanup():
+    GPIO.cleanup()
+
+def main():
+    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        print("ERROR: Camera not opened")
+        return
+
+    face_cascade = cv2.CascadeClassifier(
+        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+    )
+
+    setup_motor()
+    motor_moved = False
+    face_frames = 0
+    REQUIRED_FRAMES = 10
+
+
+    print("Running. Press q to quit.")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, 1.3, 5, minSize=(60, 60)
+            )
+
+            for (x, y, w, h) in faces:
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(
+                    frame, "Human",
+                    (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (0, 255, 0), 2
+                )
+
+            if len(faces) > 0:
+                face_frames += 1
+            else:
+                face_frames = 0
+            
+            if face_frames >= REQUIRED_FRAMES and not motor_moved:
+                print("Human detected consistently → rotating motor")
+                rotate_motor(100)
+                motor_moved = True
+
+
+            cv2.imshow("Human Detection + Motor", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        cleanup()
+        print("Exited cleanly.")
+
+if __name__ == "__main__":
+    main()
