@@ -1,0 +1,195 @@
+import time
+import sys
+import select
+import termios
+import tty
+import numpy as np
+import jetson_utils
+
+# ------------------------
+# CONFIG
+# ------------------------
+CAM_URI = "csi://0"
+
+# ROI (your tuned values)
+ROI_X = 0.210
+ROI_Y = 0.220
+ROI_W = 0.600
+ROI_H = 0.570
+
+# Presence vs reference (ENTER/EXIT)
+PIXEL_DIFF_THRESHOLD = 14        # lower helps small items
+PERCENT_ENTER_TH     = 0.0035    # 0.35% pixels changed
+PERCENT_EXIT_TH      = 0.0015    # 0.15% pixels changed
+MEAN_ENTER_TH        = 2.5       # mean abs diff vs reference
+
+# Motion/stability (between frames)
+MOTION_PIXEL_TH      = 8         # per-pixel threshold for motion
+MOTION_PERCENT_TH    = 0.0012    # motion percent below this = stable
+MOTION_MEAN_TH       = 1.3       # motion mean below this = stable
+STABLE_HOLD_SEC      = 0.35      # must be stable for this long
+
+WARMUP_FRAMES = 45
+
+# Print control
+PRINT_DEBUG = False              # True = show debug every 0.5s
+DEBUG_PERIOD_SEC = 0.5
+
+# ------------------------
+# Keyboard helper (your proven working method)
+# ------------------------
+class RawKeyReader:
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+
+    def __enter__(self):
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def get_key(self):
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+def get_roi_gray(cuda_img):
+    rgba = jetson_utils.cudaToNumpy(cuda_img)     # HxWx4 uint8
+    rgb = rgba[:, :, :3]                          # HxWx3
+    h, w, _ = rgb.shape
+
+    x1 = int(ROI_X * w)
+    y1 = int(ROI_Y * h)
+    x2 = int((ROI_X + ROI_W) * w)
+    y2 = int((ROI_Y + ROI_H) * h)
+
+    roi = rgb[y1:y2, x1:x2]
+    gray = np.mean(roi, axis=2).astype(np.uint8)
+    return gray
+
+def presence_stats(cur_gray, ref_gray):
+    diff = np.abs(cur_gray.astype(np.int16) - ref_gray.astype(np.int16))
+    mean_d = float(np.mean(diff))
+    pct_d  = float(np.mean(diff > PIXEL_DIFF_THRESHOLD))  # 0..1
+    return pct_d, mean_d
+
+def motion_stats(cur_gray, prev_gray):
+    mdiff = np.abs(cur_gray.astype(np.int16) - prev_gray.astype(np.int16))
+    mean_m = float(np.mean(mdiff))
+    pct_m  = float(np.mean(mdiff > MOTION_PIXEL_TH))       # 0..1
+    return pct_m, mean_m
+
+def main():
+    cam = jetson_utils.videoSource(CAM_URI)
+    disp = jetson_utils.videoOutput("display://0")
+
+    print("\nAUTO ROI DETECTOR (REFERENCE + MOTION STABILITY)")
+    print("Keys:")
+    print("  r : capture reference (EMPTY lid/background)")
+    print("  q : quit\n")
+
+    reference = None
+    prev_gray = None
+
+    state = "WAIT_REF"   # WAIT_REF -> READY -> EVENT -> STABLE
+    warm = 0
+    stable_start = None
+    last_debug_t = 0.0
+
+    try:
+        with RawKeyReader() as kr:
+            while disp.IsStreaming():
+                img = cam.Capture()
+                if img is None:
+                    continue
+
+                disp.Render(img)
+                disp.SetStatus("AUTO ROI DETECTOR | press 'r' for reference")
+
+                # warmup
+                if warm < WARMUP_FRAMES:
+                    warm += 1
+                    continue
+
+                # keyboard
+                key = kr.get_key()
+                if key:
+                    if key.lower() == 'q':
+                        print("Quit.")
+                        break
+                    if key.lower() == 'r':
+                        reference = get_roi_gray(img).copy()
+                        prev_gray = None
+                        state = "READY"
+                        stable_start = None
+                        print("[REFERENCE CAPTURED] Background stored. Waiting for object...")
+
+                if reference is None:
+                    continue
+
+                cur = get_roi_gray(img)
+                if prev_gray is None:
+                    prev_gray = cur
+                    continue
+
+                # compute stats
+                P, M = presence_stats(cur, reference)
+                mP, mM = motion_stats(cur, prev_gray)
+                prev_gray = cur
+
+                now = time.time()
+                if PRINT_DEBUG and (now - last_debug_t) > DEBUG_PERIOD_SEC:
+                    last_debug_t = now
+                    print(f"[DEBUG] state={state}  Presence(P={P*100:.3f}%,M={M:.2f})  Motion(mP={mP*100:.3f}%,mM={mM:.2f})")
+
+                # ------------------------
+                # STATE MACHINE
+                # ------------------------
+                if state == "READY":
+                    # ENTER when presence vs ref crosses threshold
+                    if (P >= PERCENT_ENTER_TH) and (M >= MEAN_ENTER_TH):
+                        state = "EVENT"
+                        stable_start = None
+                        print(f"[EVENT] Object ENTER | Presence P={P*100:.2f}% M={M:.2f}")
+
+                elif state == "EVENT":
+                    # become STABLE when motion stays low for STABLE_HOLD_SEC
+                    motion_is_low = (mP <= MOTION_PERCENT_TH) and (mM <= MOTION_MEAN_TH)
+                    if motion_is_low:
+                        if stable_start is None:
+                            stable_start = now
+                        elif (now - stable_start) >= STABLE_HOLD_SEC:
+                            state = "STABLE"
+                            print(f"[STABLE] Object stable | Motion mP={mP*100:.3f}% mM={mM:.2f}")
+                    else:
+                        stable_start = None
+
+                    # if user removes quickly, go back
+                    if P <= PERCENT_EXIT_TH:
+                        state = "READY"
+                        stable_start = None
+                        print("[EXIT] Object removed. Waiting for next object...")
+
+                elif state == "STABLE":
+                    # EXIT when presence drops below exit threshold
+                    if P <= PERCENT_EXIT_TH:
+                        state = "READY"
+                        stable_start = None
+                        print("[EXIT] Object removed. Waiting for next object...")
+
+                time.sleep(0.02)
+
+    except KeyboardInterrupt:
+        print("\nExiting (Ctrl+C).")
+
+    finally:
+        try:
+            cam.Close()
+            disp.Close()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
