@@ -1,0 +1,81 @@
+import time
+import Jetson.GPIO as GPIO
+
+SERVO_PIN = 33      # BOARD pin 33 (you confirmed works)
+CENTER_US = 1500    # center pulse (tune)
+DEG70_US = 450      # how far 70° is in microseconds from center (tune)
+
+# Movement timing / smoothness
+STEP_US = 10        # smaller = smoother (10-20 is good)
+STEP_DELAY = 0.002  # delay between pulse-width steps
+HOLD_TIME = 0.4     # pause at each target position
+
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+def send_pulses(pulse_us, duration=0.35, freq=50):
+    """Send servo pulses for a short duration, then stop (reduces jitter)."""
+    period = 1.0 / freq
+    high = pulse_us / 1_000_000.0
+    low = period - high
+    end = time.time() + duration
+    while time.time() < end:
+        GPIO.output(SERVO_PIN, 1)
+        time.sleep(high)
+        GPIO.output(SERVO_PIN, 0)
+        time.sleep(low)
+
+def move_smooth(start_us, target_us):
+    """Smoothly move by stepping pulse width, sending pulses briefly each step."""
+    if start_us == target_us:
+        send_pulses(target_us, duration=0.25)
+        return target_us
+
+    step = STEP_US if target_us > start_us else -STEP_US
+    pulse = start_us
+
+    while (pulse < target_us and step > 0) or (pulse > target_us and step < 0):
+        pulse += step
+        send_pulses(pulse, duration=0.06)  # short burst per step
+        time.sleep(STEP_DELAY)
+
+    # final hold at target
+    send_pulses(target_us, duration=0.35)
+    return target_us
+
+def lid_routine():
+    center = CENTER_US
+    right = CENTER_US + DEG70_US
+    left  = CENTER_US - DEG70_US
+
+    print("CENTER")
+    send_pulses(center, duration=0.5)
+    time.sleep(HOLD_TIME)
+
+    print("RIGHT (+70)")
+    cur = move_smooth(center, right)
+    time.sleep(HOLD_TIME)
+
+    print("CENTER")
+    cur = move_smooth(cur, center)
+    time.sleep(HOLD_TIME)
+
+    print("LEFT (-70)")
+    cur = move_smooth(cur, left)
+    time.sleep(HOLD_TIME)
+
+    print("CENTER")
+    cur = move_smooth(cur, center)
+    time.sleep(HOLD_TIME)
+
+if __name__ == "__main__":
+    try:
+        while True:
+            lid_routine()
+            print("Routine done. Repeating in 2 seconds... (Ctrl+C to stop)")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        GPIO.cleanup()
