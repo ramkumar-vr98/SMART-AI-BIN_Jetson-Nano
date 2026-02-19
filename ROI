@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+import sys
+import time
+import select
+import termios
+import tty
+
+import numpy as np
+import jetson_utils
+
+
+# -----------------------------
+# ROI (normalized 0..1)
+# -----------------------------
+ROI_X = 0.28
+ROI_Y = 0.05
+ROI_W = 0.45
+ROI_H = 0.93
+
+# step size for tuning (normalized)
+MOVE_STEP = 0.01
+SIZE_STEP = 0.01
+
+# drawing
+GREEN_RGB = (0, 255, 0)   # for HxWx3
+GREEN_RGBA = (0, 255, 0, 255)  # for HxWx4
+THICKNESS = 3
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def draw_rect_border(img, x1, y1, x2, y2, thickness=3):
+    """
+    Draw rectangle border on img (HxWx3 or HxWx4 uint8)
+    """
+    h, w, c = img.shape
+    x1 = clamp(int(x1), 0, w - 1)
+    x2 = clamp(int(x2), 0, w - 1)
+    y1 = clamp(int(y1), 0, h - 1)
+    y2 = clamp(int(y2), 0, h - 1)
+
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    t = max(1, int(thickness))
+
+    color = GREEN_RGB if c == 3 else GREEN_RGBA
+
+    # top
+    img[y1:y1 + t, x1:x2] = color
+    # bottom
+    img[y2 - t:y2, x1:x2] = color
+    # left
+    img[y1:y2, x1:x1 + t] = color
+    # right
+    img[y1:y2, x2 - t:x2] = color
+
+
+class KeyReader:
+    """Non-blocking single-key reader (works in terminal)"""
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def get_key(self):
+        dr, _, _ = select.select([sys.stdin], [], [], 0)
+        if dr:
+            return sys.stdin.read(1)
+        return None
+
+
+def print_roi():
+    print(f"ROI_X={ROI_X:.3f}, ROI_Y={ROI_Y:.3f}, ROI_W={ROI_W:.3f}, ROI_H={ROI_H:.3f}")
+
+
+def main():
+    global ROI_X, ROI_Y, ROI_W, ROI_H
+
+    cam = jetson_utils.videoSource("csi://0")
+    disp = jetson_utils.videoOutput("display://0")
+
+    print("\nROI TUNER KEYS:")
+    print("  w/s/a/d : move ROI up/down/left/right")
+    print("  i/k     : increase/decrease height")
+    print("  j/l     : decrease/increase width")
+    print("  + / -   : grow/shrink both width+height together")
+    print("  p       : print current ROI values")
+    print("  r       : reset ROI to defaults")
+    print("  q       : quit\n")
+    print("Tip: press 'p' after tuning to copy ROI numbers into your main script.\n")
+
+    with KeyReader() as kr:
+        while disp.IsStreaming():
+            img = cam.Capture()
+            if img is None:
+                continue
+
+            # IMPORTANT: work on a real CPU copy, then send back to CUDA for rendering
+            np_img = jetson_utils.cudaToNumpy(img).copy()   # HxWx3 or HxWx4 uint8
+            h, w, _ = np_img.shape
+
+            # Convert normalized ROI -> pixel ROI
+            x1 = ROI_X * w
+            y1 = ROI_Y * h
+            x2 = (ROI_X + ROI_W) * w
+            y2 = (ROI_Y + ROI_H) * h
+
+            draw_rect_border(np_img, x1, y1, x2, y2, TH_toggle())
+
+            # Back to CUDA for display
+            img2 = jetson_utils.cudaFromNumpy(np_img)
+            disp.Render(img2)
+            disp.SetStatus("ROI TUNER | w/s/a/d move | j/l width | i/k height | p print | q quit")
+
+            key = kr.get_key()
+            if key:
+                key = key.lower()
+
+                if key == 'q':
+                    print_roi()
+                    print("Quit.")
+                    break
+
+                elif key == 'p':
+                    print_roi()
+
+                elif key == 'r':
+                    ROI_X, ROI_Y, ROI_W, ROI_H = 0.28, 0.05, 0.45, 0.93
+                    print("ROI reset.")
+                    print_roi()
+
+                # move
+                elif key == 'w':
+                    ROI_Y -= MOVE_STEP
+                elif key == 's':
+                    ROI_Y += MOVE_STEP
+                elif key == 'a':
+                    ROI_X -= MOVE_STEP
+                elif key == 'd':
+                    ROI_X += MOVE_STEP
+
+                # size
+                elif key == 'i':
+                    ROI_H += SIZE_STEP
+                elif key == 'k':
+                    ROI_H -= SIZE_STEP
+                elif key == 'l':
+                    ROI_W += SIZE_STEP
+                elif key == 'j':
+                    ROI_W -= SIZE_STEP
+
+                # grow/shrink both
+                elif key == '+':
+                    ROI_W += SIZE_STEP
+                    ROI_H += SIZE_STEP
+                elif key == '-':
+                    ROI_W -= SIZE_STEP
+                    ROI_H -= SIZE_STEP
+
+                # clamp ROI inside [0..1]
+                ROI_W = clamp(ROI_W, 0.05, 0.98)
+                ROI_H = clamp(ROI_H, 0.05, 0.98)
+                ROI_X = clamp(ROI_X, 0.0, 1.0 - ROI_W)
+                ROI_Y = clamp(ROI_Y, 0.0, 1.0 - ROI_H)
+
+            time.sleep(0.005)
+
+
+# helper: thickness can be constant, but if you want easy tweak later.
+def TH_toggle():
+    return THICKNESS
+
+
+if __name__ == "__main__":
+    main()
