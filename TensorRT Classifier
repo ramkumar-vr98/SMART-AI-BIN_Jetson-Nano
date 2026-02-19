@@ -1,0 +1,248 @@
+import time
+import sys
+import select
+import termios
+import tty
+import numpy as np
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import Jetson.GPIO as GPIO
+import jetson_utils
+
+# ------------------------
+# CONFIG
+# ------------------------
+ENGINE_PATH = "best_fp16.engine"
+IMG_SIZE = 224
+CAM_URI = "csi://0"
+
+# ROI FOR VISUAL ONLY (does NOT affect inference)
+ROI_X = 0.210
+ROI_Y = 0.220
+ROI_W = 0.600
+ROI_H = 0.570
+
+SERVO_PIN = 33
+CENTER_US = 1500
+DELTA_US = 450
+RETURN_DELAY = 0.6
+
+THRESH = 0.60
+FRAMES_TO_AVG = 6
+SETTLE_SEC = 0.10
+CLASSES = ["metal", "non_metal"]
+
+TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+
+# ------------------------
+# TensorRT
+# ------------------------
+def load_engine(path):
+    with open(path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+        return runtime.deserialize_cuda_engine(f.read())
+
+def alloc_buffers(engine):
+    inp_shape = engine.get_binding_shape(0)
+    out_shape = engine.get_binding_shape(1)
+
+    inp_size = trt.volume(inp_shape)
+    out_size = trt.volume(out_shape)
+
+    d_input = cuda.mem_alloc(inp_size * np.float32().nbytes)
+    d_output = cuda.mem_alloc(out_size * np.float32().nbytes)
+
+    h_input = np.empty(inp_size, dtype=np.float32)
+    h_output = np.empty(out_size, dtype=np.float32)
+
+    stream = cuda.Stream()
+    bindings = [int(d_input), int(d_output)]
+
+    return (h_input, h_output, d_input, d_output, bindings, stream)
+
+def softmax(x):
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e)
+
+def resize_nn(img, out_h=224, out_w=224):
+    in_h, in_w = img.shape[:2]
+    ys = (np.linspace(0, in_h - 1, out_h)).astype(np.int32)
+    xs = (np.linspace(0, in_w - 1, out_w)).astype(np.int32)
+    return img[ys][:, xs]
+
+# 🔥 RESTORED ORIGINAL CENTER CROP
+def preprocess_rgba(rgbaframe):
+    rgb = rgbaframe[:, :, :3]
+
+    h, w, _ = rgb.shape
+    x1, x2 = int(w * 0.30), int(w * 0.70)
+    y1, y2 = int(h * 0.30), int(h * 0.70)
+
+    roi = rgb[y1:y2, x1:x2]
+
+    resized = resize_nn(roi, IMG_SIZE, IMG_SIZE).astype(np.float32) / 255.0
+    chw = np.transpose(resized, (2, 0, 1))
+    return np.expand_dims(chw, axis=0)
+
+def infer(ctx, buffers, input_batch):
+    h_input, h_output, d_input, d_output, bindings, stream = buffers
+    np.copyto(h_input, input_batch.ravel())
+    cuda.memcpy_htod_async(d_input, h_input, stream)
+    ctx.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    cuda.memcpy_dtoh_async(h_output, d_output, stream)
+    stream.synchronize()
+    logits = h_output.reshape(1, -1)[0]
+    return softmax(logits)
+
+# ------------------------
+# Servo
+# ------------------------
+def gpio_setup():
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(SERVO_PIN, GPIO.OUT)
+    GPIO.output(SERVO_PIN, 0)
+
+def send_pulses(pulse_us, duration=0.35, freq=50):
+    period = 1.0 / freq
+    high = pulse_us / 1_000_000.0
+    low = period - high
+    end = time.time() + duration
+    while time.time() < end:
+        GPIO.output(SERVO_PIN, 1)
+        time.sleep(high)
+        GPIO.output(SERVO_PIN, 0)
+        time.sleep(low)
+
+def move_servo(target_us):
+    send_pulses(target_us)
+
+# ------------------------
+# Keyboard
+# ------------------------
+class RawKeyReader:
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+
+    def __enter__(self):
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def get_key(self):
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+# ------------------------
+# Multi-frame classify
+# ------------------------
+def classify_once(cam, ctx, buffers):
+    time.sleep(SETTLE_SEC)
+
+    probs_list = []
+    for _ in range(FRAMES_TO_AVG):
+        img = cam.Capture()
+        if img is None:
+            continue
+        rgba = jetson_utils.cudaToNumpy(img)
+        batch = preprocess_rgba(rgba)
+        probs_list.append(infer(ctx, buffers, batch))
+        time.sleep(0.03)
+
+    if len(probs_list) == 0:
+        return None, None, None
+
+    avg_probs = np.mean(probs_list, axis=0)
+    idx = int(np.argmax(avg_probs))
+    label = CLASSES[idx]
+    conf = float(avg_probs[idx])
+    return label, conf, avg_probs
+
+# ------------------------
+# MAIN
+# ------------------------
+def main():
+    gpio_setup()
+    move_servo(CENTER_US)
+
+    engine = load_engine(ENGINE_PATH)
+    ctx = engine.create_execution_context()
+    buffers = alloc_buffers(engine)
+
+    cam = jetson_utils.videoSource(CAM_URI)
+    disp = jetson_utils.videoOutput("display://0")
+
+    print("LIVE preview running.")
+    print("Press 'c' to CAPTURE+CLASSIFY+SERVO once, 'q' to quit.")
+
+    try:
+        with RawKeyReader() as kr:
+            while disp.IsStreaming():
+                img = cam.Capture()
+                if img is None:
+                    continue
+
+                # ---- ROI BORDER ONLY ----
+                h = img.height
+                w = img.width
+
+                x1 = int(ROI_X * w)
+                y1 = int(ROI_Y * h)
+                x2 = int((ROI_X + ROI_W) * w)
+                y2 = int((ROI_Y + ROI_H) * h)
+
+                # draw 4 border lines
+                jetson_utils.cudaDrawLine(img, (x1,y1), (x2,y1), (0,255,0,255))
+                jetson_utils.cudaDrawLine(img, (x2,y1), (x2,y2), (0,255,0,255))
+                jetson_utils.cudaDrawLine(img, (x2,y2), (x1,y2), (0,255,0,255))
+                jetson_utils.cudaDrawLine(img, (x1,y2), (x1,y1), (0,255,0,255))
+
+                disp.Render(img)
+                disp.SetStatus("SMART_AI_BIN | keyboard capture")
+
+                key = kr.get_key()
+                if key is None:
+                    continue
+
+                if key.lower() == 'q':
+                    print("Quit.")
+                    break
+
+                if key.lower() == 'c':
+                    print("Capturing frames + classifying...")
+                    label, conf, avg_probs = classify_once(cam, ctx, buffers)
+
+                    if label is None:
+                        print("No frames captured.")
+                        continue
+
+                    print(f"FINAL: {label} ({conf:.2f}) | avg_probs={avg_probs}")
+
+                    if conf >= THRESH:
+                        if label == "metal":
+                            print("✅ METAL -> RIGHT")
+                            move_servo(CENTER_US + DELTA_US)
+                        else:
+                            print("✅ NON_METAL -> LEFT")
+                            move_servo(CENTER_US - DELTA_US)
+
+                        time.sleep(RETURN_DELAY)
+                        move_servo(CENTER_US)
+                    else:
+                        print(f"⚠️ Low confidence (<{THRESH:.2f}). No movement.")
+
+    finally:
+        GPIO.cleanup()
+        try:
+            cam.Close()
+            disp.Close()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
