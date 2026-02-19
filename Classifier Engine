@@ -1,0 +1,57 @@
+import cv2
+import numpy as np
+import onnxruntime as ort
+from pathlib import Path
+
+# ---- CONFIG ----
+MODEL_PATH = "models/best.onnx"
+IMG_PATH = "test.jpg"   # we will put a test image in SMART_AI_BIN
+IMG_SIZE = 224
+
+# IMPORTANT: class order is based on your folder names used in training.
+# Ultralytics usually sorts class folder names alphabetically.
+# You used: metal, non_metal  -> so index 0=metal, index 1=non_metal
+CLASS_NAMES = ["metal", "non_metal"]
+
+def softmax(x):
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e)
+
+def preprocess_bgr(img_bgr):
+    img = cv2.resize(img_bgr, (IMG_SIZE, IMG_SIZE))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
+    img = np.expand_dims(img, axis=0)   # -> NCHW
+    return img
+
+def main():
+    if not Path(MODEL_PATH).exists():
+        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+
+    if not Path(IMG_PATH).exists():
+        raise FileNotFoundError(
+            f"Image not found: {IMG_PATH}\n"
+            f"Put a test image named 'test.jpg' inside: ~/SMART_AI_BIN/"
+        )
+
+    print("Loading model:", MODEL_PATH)
+    sess = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    img = cv2.imread(IMG_PATH)
+    x = preprocess_bgr(img)
+
+    logits = sess.run([output_name], {input_name: x})[0][0]  # shape (2,)
+    probs = softmax(logits)
+
+    pred_idx = int(np.argmax(probs))
+    print("Prediction:", CLASS_NAMES[pred_idx])
+    print("Confidence:", float(probs[pred_idx]))
+    print("All probs:", {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))})
+
+if __name__ == "__main__":
+    main()
