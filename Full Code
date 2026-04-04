@@ -1,0 +1,814 @@
+import os
+import sys
+import time
+import numpy as np
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import Jetson.GPIO as GPIO
+import jetson_utils
+
+from PyQt5 import QtWidgets, QtGui, QtCore, uic
+
+
+# =========================
+# CONFIG
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UI_PATH = os.path.join(BASE_DIR, "user.ui")
+ENGINE_PATH = os.path.join(BASE_DIR, "best_fp16.engine")
+
+IMG_SIZE = 224
+CAM_URI = "csi://0"
+
+# Detection ROI
+ROI_X = 0.10
+ROI_Y = 0.10
+ROI_W = 0.80
+ROI_H = 0.78
+
+# Ultrasonic
+TRIG_PIN = 16
+ECHO_PIN = 18
+FULL_THRESHOLD_CM = 5.0
+ULTRASONIC_INTERVAL_MS = 300
+TIMEOUT_SEC = 0.03
+
+# Motor
+SERVO_PIN = 33
+CENTER_US = 1500
+
+HOME_US = 1500
+DELTA_US = 350
+
+OUT_STEP_US = 18
+OUT_STEP_DELAY = 0.015
+
+BACK_STEP_US = 8
+BACK_STEP_DELAY = 0.02
+
+HOLD_AT_TARGET = 1.2
+HOLD_AT_HOME = 0.3
+
+THRESH = 0.55
+FRAMES_TO_AVG = 8
+SETTLE_SEC = 0.10
+CLASSES = ["metal", "non_metal"]
+
+MAX_CLASSIFY_RETRIES = 5
+RETRY_GAP_SEC = 0.20
+
+# Presence vs reference
+PIXEL_DIFF_THRESHOLD = 18
+PERCENT_ENTER_TH = 0.012
+PERCENT_EXIT_TH = 0.0045
+MEAN_ENTER_TH = 7.0
+
+# Motion / stability
+MOTION_PIXEL_TH = 10
+MOTION_PERCENT_TH = 0.0035
+MOTION_MEAN_TH = 2.2
+STABLE_HOLD_SEC = 0.60
+
+WARMUP_FRAMES = 45
+
+# Debounce
+EXIT_DEBOUNCE_SEC = 0.6
+ENTER_MIN_GAP_SEC = 1.5
+ENTER_HOLD_SEC = 0.40
+
+# Post-servo settle before countdown
+POST_CENTER_SETTLE_SEC = 0.25
+POST_SORT_COOLDOWN_SEC = 1.5
+
+TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+
+
+# =========================
+# TensorRT Helpers
+# =========================
+def load_engine(path):
+    with open(path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+        return runtime.deserialize_cuda_engine(f.read())
+
+
+def alloc_buffers(engine):
+    inp_shape = engine.get_binding_shape(0)
+    out_shape = engine.get_binding_shape(1)
+
+    inp_size = trt.volume(inp_shape)
+    out_size = trt.volume(out_shape)
+
+    d_input = cuda.mem_alloc(inp_size * np.float32().nbytes)
+    d_output = cuda.mem_alloc(out_size * np.float32().nbytes)
+
+    h_input = np.empty(inp_size, dtype=np.float32)
+    h_output = np.empty(out_size, dtype=np.float32)
+
+    stream = cuda.Stream()
+    bindings = [int(d_input), int(d_output)]
+    return (h_input, h_output, d_input, d_output, bindings, stream)
+
+
+def softmax(x):
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.sum(e)
+
+
+def resize_nn(img, out_h=224, out_w=224):
+    in_h, in_w = img.shape[:2]
+    ys = (np.linspace(0, in_h - 1, out_h)).astype(np.int32)
+    xs = (np.linspace(0, in_w - 1, out_w)).astype(np.int32)
+    return img[ys][:, xs]
+
+
+def crop_by_norm(rgb, x, y, w, h):
+    H, W, _ = rgb.shape
+    x1 = int(x * W)
+    y1 = int(y * H)
+    x2 = int((x + w) * W)
+    y2 = int((y + h) * H)
+
+    x1 = max(0, min(W - 2, x1))
+    y1 = max(0, min(H - 2, y1))
+    x2 = max(x1 + 1, min(W, x2))
+    y2 = max(y1 + 1, min(H, y2))
+
+    return rgb[y1:y2, x1:x2]
+
+
+def clamp01(v):
+    return max(0.0, min(1.0, v))
+
+
+def preprocess_rgba_dynamic(rgbaframe, bbox):
+    rgb = rgbaframe[:, :, :3]
+    x, y, w, h = bbox
+    roi = crop_by_norm(rgb, x, y, w, h)
+    resized = resize_nn(roi, IMG_SIZE, IMG_SIZE).astype(np.float32) / 255.0
+    chw = np.transpose(resized, (2, 0, 1))
+    return np.expand_dims(chw, axis=0)
+
+
+def infer(ctx, buffers, input_batch):
+    h_input, h_output, d_input, d_output, bindings, stream = buffers
+    np.copyto(h_input, input_batch.ravel())
+    cuda.memcpy_htod_async(d_input, h_input, stream)
+    ctx.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    cuda.memcpy_dtoh_async(h_output, d_output, stream)
+    stream.synchronize()
+    logits = h_output.reshape(1, -1)[0]
+    return softmax(logits)
+
+
+# =========================
+# GPIO / Servo / Ultrasonic
+# =========================
+def gpio_setup():
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BOARD)
+
+    # Servo
+    GPIO.setup(SERVO_PIN, GPIO.OUT)
+    GPIO.output(SERVO_PIN, 0)
+
+    # Ultrasonic
+    GPIO.setup(TRIG_PIN, GPIO.OUT)
+    GPIO.setup(ECHO_PIN, GPIO.IN)
+    GPIO.output(TRIG_PIN, False)
+    time.sleep(0.2)
+
+
+def send_pulses(pulse_us, duration=0.20, freq=50):
+    period = 1.0 / freq
+    high = pulse_us / 1_000_000.0
+    low = period - high
+    end = time.time() + duration
+
+    while time.time() < end:
+        GPIO.output(SERVO_PIN, 1)
+        time.sleep(high)
+        GPIO.output(SERVO_PIN, 0)
+        time.sleep(low)
+
+
+def sweep_servo(start_us, end_us, step_us, step_delay):
+    if start_us == end_us:
+        send_pulses(end_us, duration=HOLD_AT_HOME)
+        return end_us
+
+    step = abs(step_us)
+    if end_us < start_us:
+        step = -step
+
+    current = start_us
+    while (step > 0 and current < end_us) or (step < 0 and current > end_us):
+        current += step
+
+        if (step > 0 and current > end_us) or (step < 0 and current < end_us):
+            current = end_us
+
+        send_pulses(current, duration=step_delay)
+
+    return end_us
+
+
+def measure_distance_cm():
+    GPIO.output(TRIG_PIN, False)
+    time.sleep(0.0002)
+
+    GPIO.output(TRIG_PIN, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG_PIN, False)
+
+    start_wait = time.time()
+    pulse_start = start_wait
+    while GPIO.input(ECHO_PIN) == 0:
+        pulse_start = time.time()
+        if pulse_start - start_wait > TIMEOUT_SEC:
+            return None
+
+    start_high = time.time()
+    pulse_end = start_high
+    while GPIO.input(ECHO_PIN) == 1:
+        pulse_end = time.time()
+        if pulse_end - start_high > TIMEOUT_SEC:
+            return None
+
+    pulse_duration = pulse_end - pulse_start
+    distance_cm = (pulse_duration * 34300) / 2.0
+    return distance_cm
+
+
+# =========================
+# Detection / Motion Helpers
+# =========================
+def get_roi_gray_from_rgba(rgba):
+    rgb = rgba[:, :, :3]
+    roi = crop_by_norm(rgb, ROI_X, ROI_Y, ROI_W, ROI_H)
+    gray = np.mean(roi, axis=2).astype(np.uint8)
+    return gray
+
+
+def presence_stats(cur_gray, ref_gray):
+    diff = np.abs(cur_gray.astype(np.int16) - ref_gray.astype(np.int16))
+    mean_d = float(np.mean(diff))
+    pct_d = float(np.mean(diff > PIXEL_DIFF_THRESHOLD))
+    return pct_d, mean_d
+
+
+def motion_stats(cur_gray, prev_gray):
+    mdiff = np.abs(cur_gray.astype(np.int16) - prev_gray.astype(np.int16))
+    mean_m = float(np.mean(mdiff))
+    pct_m = float(np.mean(mdiff > MOTION_PIXEL_TH))
+    return pct_m, mean_m
+
+
+def get_object_bbox_from_reference(rgba, ref_gray, diff_th=20, pad=0.12):
+    rgb = rgba[:, :, :3]
+    H, W, _ = rgb.shape
+
+    rx1 = int(ROI_X * W)
+    ry1 = int(ROI_Y * H)
+    rx2 = int((ROI_X + ROI_W) * W)
+    ry2 = int((ROI_Y + ROI_H) * H)
+
+    rx1 = max(0, min(W - 2, rx1))
+    ry1 = max(0, min(H - 2, ry1))
+    rx2 = max(rx1 + 1, min(W, rx2))
+    ry2 = max(ry1 + 1, min(H, ry2))
+
+    roi = rgb[ry1:ry2, rx1:rx2]
+    cur_gray = np.mean(roi, axis=2).astype(np.uint8)
+
+    if ref_gray is None or ref_gray.shape != cur_gray.shape:
+        return None
+
+    diff = np.abs(cur_gray.astype(np.int16) - ref_gray.astype(np.int16))
+    mask = diff > diff_th
+
+    if np.count_nonzero(mask) < 40:
+        return None
+
+    ys, xs = np.where(mask)
+    y1 = ys.min()
+    y2 = ys.max()
+    x1 = xs.min()
+    x2 = xs.max()
+
+    bx1 = (rx1 + x1) / float(W)
+    by1 = (ry1 + y1) / float(H)
+    bx2 = (rx1 + x2) / float(W)
+    by2 = (ry1 + y2) / float(H)
+
+    bw = bx2 - bx1
+    bh = by2 - by1
+
+    bx1 = clamp01(bx1 - pad * bw)
+    by1 = clamp01(by1 - pad * bh)
+    bx2 = clamp01(bx2 + pad * bw)
+    by2 = clamp01(by2 + pad * bh)
+
+    min_w = 0.08
+    min_h = 0.08
+
+    if (bx2 - bx1) < min_w:
+        cx = (bx1 + bx2) / 2.0
+        bx1 = clamp01(cx - min_w / 2.0)
+        bx2 = clamp01(cx + min_w / 2.0)
+
+    if (by2 - by1) < min_h:
+        cy = (by1 + by2) / 2.0
+        by1 = clamp01(cy - min_h / 2.0)
+        by2 = clamp01(cy + min_h / 2.0)
+
+    return (bx1, by1, bx2 - bx1, by2 - by1)
+
+
+# =========================
+# Main UI
+# =========================
+class SmartBinUI(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        if not os.path.isfile(UI_PATH):
+            raise FileNotFoundError(f"UI file not found: {UI_PATH}")
+        if not os.path.isfile(ENGINE_PATH):
+            raise FileNotFoundError(f"Engine file not found: {ENGINE_PATH}")
+
+        uic.loadUi(UI_PATH, self)
+
+        self.title_label.setText("SMART AI BIN")
+        self.instruction_label.setText("Workflow: Start Camera → Capture Ref Frame → Place Object")
+        self.status_label.setText("System ready. Press Start Camera.")
+        self.error_label.setText("No errors.")
+        self.distance_label.setText("Distance: -- cm")
+        self.bin_status_label.setText("Bin status: Waiting")
+        self.bin_status_label.setWordWrap(True)
+        self.metal_count_label.setText("Metal: 0")
+        self.nonmetal_count_label.setText("Non-metal: 0")
+        self.camera_label.setText("Camera not started")
+        self.camera_label.setAlignment(QtCore.Qt.AlignCenter)
+
+        self.current_servo_us = HOME_US
+
+        self.start_button.clicked.connect(self.start_camera)
+        self.stop_button.clicked.connect(self.stop_camera)
+        self.ref_button.clicked.connect(self.capture_reference)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update_frame)
+
+        self.ultra_timer = QtCore.QTimer(self)
+        self.ultra_timer.timeout.connect(self.update_ultrasonic)
+
+        self.cam = None
+        self.engine = None
+        self.ctx = None
+        self.buffers = None
+
+        self.latest_rgba = None
+        self.reference = None
+        self.prev_gray = None
+        self.state = "IDLE"
+
+        self.warm = 0
+        self.stable_start = None
+        self.enter_start = None
+        self.last_exit_t = 0.0
+        self.last_enter_t = 0.0
+
+        self.metal_count = 0
+        self.nonmetal_count = 0
+
+        self.bin_full = False
+        self.latest_distance_cm = None
+
+        self.cooldown_until = 0.0
+
+        gpio_setup()
+
+    # -------------------------
+    # Small UI helpers
+    # -------------------------
+    def set_status(self, text):
+        self.status_label.setText(text)
+
+    def set_error(self, text):
+        self.error_label.setText(text)
+
+    def update_counts(self):
+        self.metal_count_label.setText(f"Metal: {self.metal_count}")
+        self.nonmetal_count_label.setText(f"Non-metal: {self.nonmetal_count}")
+
+    def reset_runtime_state(self):
+        self.latest_rgba = None
+        self.reference = None
+        self.prev_gray = None
+        self.state = "WAIT_REF"
+        self.warm = 0
+        self.stable_start = None
+        self.enter_start = None
+        self.last_exit_t = 0.0
+        self.last_enter_t = 0.0
+        self.cooldown_until = 0.0
+
+    # -------------------------
+    # Camera start/stop
+    # -------------------------
+    def start_camera(self):
+        try:
+            if self.engine is None:
+                self.engine = load_engine(ENGINE_PATH)
+                self.ctx = self.engine.create_execution_context()
+                self.buffers = alloc_buffers(self.engine)
+
+            if self.cam is None:
+                self.cam = jetson_utils.videoSource(CAM_URI)
+
+            self.reset_runtime_state()
+            self.timer.start(30)
+            self.ultra_timer.start(ULTRASONIC_INTERVAL_MS)
+
+            self.set_status("Camera started. Press Capture Ref Frame when lid is empty.")
+            self.set_error("No errors.")
+            self.camera_label.setText("Starting camera...")
+        except Exception as e:
+            self.set_status("Failed to start camera.")
+            self.set_error(f"Start error: {e}")
+
+    def stop_camera(self):
+        self.timer.stop()
+        self.ultra_timer.stop()
+
+        try:
+            if self.cam is not None:
+                self.cam.Close()
+        except Exception:
+            pass
+
+        self.cam = None
+        self.latest_rgba = None
+        self.reference = None
+        self.prev_gray = None
+        self.state = "IDLE"
+
+        self.camera_label.setPixmap(QtGui.QPixmap())
+        self.camera_label.setText("Camera stopped")
+        self.set_status("Camera stopped.")
+        self.set_error("No errors.")
+        self.distance_label.setText("Distance: -- cm")
+        self.bin_status_label.setText("Bin status: Waiting")
+        self.bin_status_label.setStyleSheet("")
+
+    # -------------------------
+    # Manual reference capture
+    # -------------------------
+    def capture_reference(self):
+        if self.bin_full:
+            self.set_status("Bin is full, cannot capture reference.")
+            self.set_error("Please empty the bin first.")
+            return
+
+        if self.latest_rgba is None:
+            self.set_status("No frame available yet.")
+            self.set_error("Start camera first, then capture reference.")
+            return
+
+        self.reference = get_roi_gray_from_rgba(self.latest_rgba).copy()
+        self.prev_gray = None
+        self.state = "READY"
+        self.stable_start = None
+        self.enter_start = None
+        self.last_exit_t = time.time()
+        self.last_enter_t = 0.0
+
+        self.set_status("Reference captured. Waiting for object...")
+        self.set_error("No errors.")
+
+    # -------------------------
+    # Frame display
+    # -------------------------
+    def show_frame(self, rgba):
+        rgb = np.ascontiguousarray(rgba[:, :, :3])
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+
+        qimg = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg)
+
+        self.camera_label.setPixmap(
+            pix.scaled(
+                self.camera_label.width(),
+                self.camera_label.height(),
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation
+            )
+        )
+
+    # -------------------------
+    # Classification helpers
+    # -------------------------
+    def classify_once(self):
+        time.sleep(SETTLE_SEC)
+
+        probs_list = []
+
+        for _ in range(FRAMES_TO_AVG):
+            img = self.cam.Capture()
+            if img is None:
+                continue
+
+            rgba = jetson_utils.cudaToNumpy(img)
+            bbox = get_object_bbox_from_reference(rgba, self.reference, diff_th=20, pad=0.12)
+
+            if bbox is None:
+                continue
+
+            batch = preprocess_rgba_dynamic(rgba, bbox)
+            probs = infer(self.ctx, self.buffers, batch)
+            probs_list.append(probs)
+
+            time.sleep(0.03)
+
+        if len(probs_list) == 0:
+            return None, None, None
+
+        avg_probs = np.mean(probs_list, axis=0)
+        idx = int(np.argmax(avg_probs))
+        label = CLASSES[idx]
+        conf = float(avg_probs[idx])
+        return label, conf, avg_probs
+
+    def classify_with_retries(self):
+        best_label, best_conf, best_probs = None, -1.0, None
+
+        for _ in range(MAX_CLASSIFY_RETRIES):
+            label, conf, probs = self.classify_once()
+            if label is None:
+                continue
+
+            if conf > best_conf:
+                best_label, best_conf, best_probs = label, conf, probs
+
+            if conf >= THRESH:
+                return best_label, best_conf, best_probs, True
+
+            time.sleep(RETRY_GAP_SEC)
+
+        return best_label, best_conf, best_probs, False
+
+    # -------------------------
+    # Ultrasonic update
+    # -------------------------
+    def update_ultrasonic(self):
+        distance = measure_distance_cm()
+        self.latest_distance_cm = distance
+
+        if distance is None:
+            self.distance_label.setText("Distance: -- cm")
+            return
+
+        self.distance_label.setText(f"Distance: {distance:.1f} cm")
+
+        if distance <= FULL_THRESHOLD_CM:
+            self.bin_full = True
+            self.bin_status_label.setText("Bin is full, motor stopped, wait for empty.")
+            self.bin_status_label.setStyleSheet("color: red; font-weight: bold; font-size: 16px;")
+
+        else:
+            self.bin_full = False
+            self.bin_status_label.setText("Bin has space. System ready.")
+            self.bin_status_label.setStyleSheet("color: green; font-weight: bold; font-size: 16px;")
+
+
+    # -------------------------
+    # Success flow
+    # -------------------------
+    def success_cycle(self, label, conf):
+        if self.bin_full:
+            self.set_status("Bin is full, motor stopped, wait for empty.")
+            self.set_error("Sorting blocked by ultrasonic sensor.")
+            return
+
+        if label == "metal":
+            self.metal_count += 1
+            self.update_counts()
+            self.set_status(f"Classified: METAL ({conf:.2f})")
+            self.set_error("Object classified successfully.")
+            QtWidgets.QApplication.processEvents()
+            target_us = HOME_US + DELTA_US
+        else:
+            self.nonmetal_count += 1
+            self.update_counts()
+            self.set_status(f"Classified: NON-METAL ({conf:.2f})")
+            self.set_error("Object classified successfully.")
+            QtWidgets.QApplication.processEvents()
+            target_us = HOME_US - DELTA_US
+
+        self.current_servo_us = sweep_servo(
+            self.current_servo_us,
+            target_us,
+            OUT_STEP_US,
+            OUT_STEP_DELAY
+        )
+
+        self.set_status("Settling at sorting position...")
+        QtWidgets.QApplication.processEvents()
+        send_pulses(target_us, duration=0.20)
+
+        self.set_status("Waiting for object to slide...")
+        QtWidgets.QApplication.processEvents()
+        time.sleep(HOLD_AT_TARGET)
+
+        self.current_servo_us = sweep_servo(
+            self.current_servo_us,
+            HOME_US,
+            BACK_STEP_US,
+            BACK_STEP_DELAY
+        )
+
+        send_pulses(HOME_US, duration=HOLD_AT_HOME)
+
+        self.set_status("Lid back to center. Auto-capturing reference soon...")
+        QtWidgets.QApplication.processEvents()
+
+        time.sleep(POST_CENTER_SETTLE_SEC)
+
+        for n in [3, 2, 1]:
+            self.set_status(f"Object classified. Please wait {n}...")
+            QtWidgets.QApplication.processEvents()
+            time.sleep(1.0)
+
+        ref_img = self.cam.Capture()
+        if ref_img is not None:
+            ref_rgba = jetson_utils.cudaToNumpy(ref_img)
+            self.latest_rgba = ref_rgba
+            self.show_frame(ref_rgba)
+
+            self.reference = get_roi_gray_from_rgba(ref_rgba).copy()
+            self.prev_gray = None
+            self.state = "READY"
+            self.stable_start = None
+            self.enter_start = None
+            self.last_exit_t = time.time()
+            self.last_enter_t = 0.0
+            self.cooldown_until = time.time() + POST_SORT_COOLDOWN_SEC
+
+            self.set_status("Okay, you can now place the next object.")
+            self.set_error("No errors.")
+        else:
+            self.reference = None
+            self.prev_gray = None
+            self.state = "WAIT_REF"
+            self.set_status("Auto reference capture failed.")
+            self.set_error("Please press Capture Ref Frame again before placing next object.")
+
+    # -------------------------
+    # Main update loop
+    # -------------------------
+    def update_frame(self):
+        if self.cam is None:
+            return
+
+        img = self.cam.Capture()
+        if img is None:
+            return
+
+        rgba = jetson_utils.cudaToNumpy(img)
+        self.latest_rgba = rgba
+        self.show_frame(rgba)
+
+        if self.warm < WARMUP_FRAMES:
+            self.warm += 1
+            self.set_status("Warming up camera...")
+            return
+
+        if self.reference is None:
+            self.state = "WAIT_REF"
+            self.set_status("Press Capture Ref Frame with empty lid.")
+            return
+
+        if self.state == "BUSY":
+            return
+
+        if self.bin_full:
+            return
+        
+        if time.time() < self.cooldown_until:
+            return
+
+        now = time.time()
+        cur = get_roi_gray_from_rgba(rgba)
+
+        if self.prev_gray is None:
+            self.prev_gray = cur
+            return
+
+        P, M = presence_stats(cur, self.reference)
+        mP, mM = motion_stats(cur, self.prev_gray)
+        self.prev_gray = cur
+
+        if self.state == "READY":
+            if (now - self.last_exit_t) < EXIT_DEBOUNCE_SEC:
+                return
+
+            object_present = (P >= PERCENT_ENTER_TH) and (M >= MEAN_ENTER_TH)
+
+            if object_present:
+                if self.enter_start is None:
+                    self.enter_start = now
+                elif (now - self.enter_start) >= ENTER_HOLD_SEC:
+                    if (now - self.last_enter_t) < ENTER_MIN_GAP_SEC:
+                        return
+                    self.last_enter_t = now
+                    self.state = "EVENT"
+                    self.stable_start = None
+                    self.enter_start = None
+                    self.set_status("Object detected. Waiting for stability...")
+                    self.set_error("No errors.")
+            else:
+                self.enter_start = None
+
+        elif self.state == "EVENT":
+            motion_is_low = (mP <= MOTION_PERCENT_TH) and (mM <= MOTION_MEAN_TH)
+
+            if motion_is_low:
+                if self.stable_start is None:
+                    self.stable_start = now
+                elif (now - self.stable_start) >= STABLE_HOLD_SEC:
+                    self.state = "STABLE"
+                    self.set_status("Object stable. Running classification...")
+            else:
+                self.stable_start = None
+
+            if P <= PERCENT_EXIT_TH:
+                self.state = "READY"
+                self.stable_start = None
+                self.enter_start = None
+                self.last_exit_t = now
+                self.set_status("Object removed. Waiting for object...")
+                self.set_error("No errors.")
+
+        elif self.state == "STABLE":
+            P2, M2 = presence_stats(cur, self.reference)
+            if P2 < 0.0015 or M2 < 2.0:
+                self.state = "READY"
+                self.stable_start = None
+                self.enter_start = None
+                self.prev_gray = None
+                self.last_exit_t = now
+                self.set_status("Presence too weak. Waiting for object...")
+                self.set_error("Place object clearly before classification.")
+                return
+
+            self.state = "BUSY"
+            QtWidgets.QApplication.processEvents()
+
+            label, conf, probs, ok = self.classify_with_retries()
+
+            if label is None:
+                self.reference = None
+                self.prev_gray = None
+                self.state = "WAIT_REF"
+                self.set_status("Unable to capture classification frames.")
+                self.set_error("Please remove object and press Capture Ref Frame again.")
+                return
+
+            if ok:
+                self.success_cycle(label, conf)
+            else:
+                self.reference = None
+                self.prev_gray = None
+                self.state = "WAIT_REF"
+                self.set_status("Classification failed.")
+                self.set_error(
+                    f"Unable to identify object confidently (best: {label}, {conf:.2f}). "
+                    f"Please remove item and press Capture Ref Frame again."
+                )
+
+    # -------------------------
+    # Clean exit
+    # -------------------------
+    def closeEvent(self, event):
+        try:
+            self.stop_camera()
+        finally:
+            GPIO.cleanup()
+        event.accept()
+
+
+# =========================
+# Main
+# =========================
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = SmartBinUI()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
