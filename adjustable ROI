@@ -1,0 +1,100 @@
+import os
+import cv2
+import jetson_utils
+
+# Initial ROI ratios
+ROI_X1_RATIO = 0.30
+ROI_Y1_RATIO = 0.30
+ROI_X2_RATIO = 0.70
+ROI_Y2_RATIO = 0.70
+
+def crop_roi(frame_bgr):
+    h, w = frame_bgr.shape[:2]
+    x1 = int(w * ROI_X1_RATIO)
+    y1 = int(h * ROI_Y1_RATIO)
+    x2 = int(w * ROI_X2_RATIO)
+    y2 = int(h * ROI_Y2_RATIO)
+    crop = frame_bgr[y1:y2, x1:x2]
+    return crop, (x1, y1, x2, y2)
+
+def main():
+    global ROI_X1_RATIO, ROI_Y1_RATIO, ROI_X2_RATIO, ROI_Y2_RATIO
+
+    cam = jetson_utils.videoSource("csi://0")
+    display = jetson_utils.videoOutput("display://0")
+
+    print("\nDATASET CAPTURE MODE")
+    print("Arrow keys = move rectangle")
+    print("W/S = increase/decrease height")
+    print("A/D = increase/decrease width")
+    print("m = save as metal | n = save as non_metal | q = quit\n")
+
+    while display.IsStreaming():
+        img = cam.Capture()
+        if img is None:
+            continue
+
+        rgba = jetson_utils.cudaToNumpy(img)
+        frame_bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+
+        crop, (x1, y1, x2, y2) = crop_roi(frame_bgr)
+
+        # draw capture rectangle
+        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # overlay instructions
+        cv2.putText(frame_bgr,
+            "Arrows=move | W/S=height | A/D=width | m/n=save | q=quit",
+            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # overlay current values
+        text1 = f"Ratios: X1={ROI_X1_RATIO:.2f}, Y1={ROI_Y1_RATIO:.2f}, X2={ROI_X2_RATIO:.2f}, Y2={ROI_Y2_RATIO:.2f}"
+        text2 = f"Pixels: x1={x1}, y1={y1}, x2={x2}, y2={y2}, W={x2-x1}, H={y2-y1}"
+        cv2.putText(frame_bgr, text1, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(frame_bgr, text2, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        cv2.imshow("Capture Window", frame_bgr)
+        key = cv2.waitKey(1) & 0xFF
+
+        step = 0.02  # adjustment step
+
+        # Move rectangle
+        if key == 82:  # Up arrow
+            ROI_Y1_RATIO = max(0, ROI_Y1_RATIO - step)
+            ROI_Y2_RATIO = max(ROI_Y1_RATIO + 0.1, ROI_Y2_RATIO - step)
+        elif key == 84:  # Down arrow
+            ROI_Y1_RATIO = min(ROI_Y2_RATIO - 0.1, ROI_Y1_RATIO + step)
+            ROI_Y2_RATIO = min(1, ROI_Y2_RATIO + step)
+        elif key == 81:  # Left arrow
+            ROI_X1_RATIO = max(0, ROI_X1_RATIO - step)
+            ROI_X2_RATIO = max(ROI_X1_RATIO + 0.1, ROI_X2_RATIO - step)
+        elif key == 83:  # Right arrow
+            ROI_X1_RATIO = min(ROI_X2_RATIO - 0.1, ROI_X1_RATIO + step)
+            ROI_X2_RATIO = min(1, ROI_X2_RATIO + step)
+
+        # Resize rectangle
+        elif key == ord('w'):  # increase height
+            ROI_Y2_RATIO = min(1, ROI_Y2_RATIO + step)
+        elif key == ord('s'):  # decrease height
+            ROI_Y2_RATIO = max(ROI_Y1_RATIO + 0.1, ROI_Y2_RATIO - step)
+        elif key == ord('d'):  # increase width
+            ROI_X2_RATIO = min(1, ROI_X2_RATIO + step)
+        elif key == ord('a'):  # decrease width
+            ROI_X2_RATIO = max(ROI_X1_RATIO + 0.1, ROI_X2_RATIO - step)
+
+        # Save images
+        elif key == ord('m'):
+            filename = f"metal_{int(cv2.getTickCount())}.jpg"
+            cv2.imwrite(filename, crop)
+            print(f"Saved: {filename}")
+        elif key == ord('n'):
+            filename = f"non_metal_{int(cv2.getTickCount())}.jpg"
+            cv2.imwrite(filename, crop)
+            print(f"Saved: {filename}")
+        elif key == ord('q'):
+            break
+
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
